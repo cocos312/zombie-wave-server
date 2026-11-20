@@ -1,0 +1,489 @@
+require('dotenv').config();
+const express = require('express');
+const crypto = require('crypto');
+const { Pool } = require('pg');
+
+const app = express();
+app.use(express.json({ limit: '256kb' }));
+
+// CORS для Telegram Mini App
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-telegram-init-data');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
+const { BOT_TOKEN, DATABASE_URL, WEBHOOK_SECRET } = process.env;
+
+if (!BOT_TOKEN || !DATABASE_URL || !WEBHOOK_SECRET) {
+  console.error('Missing BOT_TOKEN, DATABASE_URL, or WEBHOOK_SECRET environment variable.');
+  process.exit(1);
+}
+
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: process.env.PGSSL === 'true'
+    ? { rejectUnauthorized: false }
+    : undefined
+});
+
+// Товары и цены в Telegram Stars
+const PRODUCTS = {
+  plasmacutter: {
+    title: 'Плазморез',
+    stars: 99,
+    type: 'weapon'
+  },
+  thunderer: {
+    title: 'Громовержец',
+    stars: 199,
+    type: 'weapon'
+  },
+  railgun: {
+    title: 'Рельсотрон',
+    stars: 299,
+    type: 'weapon'
+  },
+  coins100: {
+    title: '100 игровых монет',
+    stars: 10,
+    type: 'coins',
+    amount: 100
+  }
+};
+
+async function telegram(method, body) {
+  const response = await fetch(
+    `https://api.telegram.org/bot${BOT_TOKEN}/${method}`,
+    {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json'
+      },
+      body: JSON.stringify(body)
+    }
+  );
+
+  const data = await response.json();
+
+  if (!response.ok || !data.ok) {
+    throw new Error(
+      data.description || `Telegram API error: ${method}`
+    );
+  }
+
+  return data.result;
+}
+
+// Создание таблиц базы данных
+async function initDb() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS game_users (
+      telegram_id BIGINT PRIMARY KEY,
+      coins BIGINT NOT NULL DEFAULT 0,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS payments (
+      payload UUID PRIMARY KEY,
+      telegram_id BIGINT NOT NULL,
+      product_id TEXT NOT NULL,
+      stars INTEGER NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      telegram_charge_id TEXT UNIQUE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      paid_at TIMESTAMPTZ
+    );
+
+    CREATE TABLE IF NOT EXISTS owned_weapons (
+      telegram_id BIGINT NOT NULL,
+      weapon_id TEXT NOT NULL,
+      acquired_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (telegram_id, weapon_id)
+    );
+  `);
+}
+
+// Проверка подлинности Telegram initData
+function verifyInitData(initData) {
+  if (
+    typeof initData !== 'string' ||
+    !initData ||
+    initData.length > 10000
+  ) {
+    throw new Error('Missing Telegram initData');
+  }
+
+  const params = new URLSearchParams(initData);
+  const receivedHash = params.get('hash');
+  const authDate = Number(params.get('auth_date'));
+
+  if (!receivedHash || !Number.isFinite(authDate)) {
+    throw new Error('Invalid Telegram initData');
+  }
+
+  if (Math.abs(Date.now() / 1000 - authDate) > 86400) {
+    throw new Error('Telegram session expired; reopen the game');
+  }
+
+  params.delete('hash');
+
+  const checkString = [...params.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([k, v]) => `${k}=${v}`)
+    .join('\n');
+
+  const secretKey = crypto
+    .createHmac('sha256', 'WebAppData')
+    .update(BOT_TOKEN)
+    .digest();
+
+  const calculated = crypto
+    .createHmac('sha256', secretKey)
+    .update(checkString)
+    .digest();
+
+  let received;
+
+  try {
+    received = Buffer.from(receivedHash, 'hex');
+  } catch {
+    throw new Error('Invalid Telegram hash');
+  }
+
+  if (
+    received.length !== calculated.length ||
+    !crypto.timingSafeEqual(received, calculated)
+  ) {
+    throw new Error('Telegram initData signature mismatch');
+  }
+
+  const userRaw = params.get('user');
+
+  if (!userRaw) {
+    throw new Error('Telegram user is missing');
+  }
+
+  const user = JSON.parse(userRaw);
+
+  if (!user || !user.id) {
+    throw new Error('Invalid Telegram user');
+  }
+
+  return String(user.id);
+}
+
+// Авторизация пользователя
+function requireTelegramUser(req, res, next) {
+  try {
+    req.telegramId = verifyInitData(
+      req.get('x-telegram-init-data')
+    );
+
+    next();
+  } catch (error) {
+    res.status(401).json({
+      ok: false,
+      error: error.message
+    });
+  }
+}
+
+// Проверка сервера
+app.get('/health', (_req, res) => {
+  res.json({
+    ok: true,
+    service: 'zombie-wave-stars-server'
+  });
+});
+
+// Каталог товаров
+app.get('/api/catalog', (_req, res) => {
+  res.json({
+    products: Object.entries(PRODUCTS).map(([id, p]) => ({
+      id,
+      title: p.title,
+      stars: p.stars
+    }))
+  });
+});
+
+// Данные игрока
+app.get('/api/me', requireTelegramUser, async (req, res) => {
+  try {
+    const userId = req.telegramId;
+
+    await pool.query(
+      'INSERT INTO game_users (telegram_id) VALUES ($1) ON CONFLICT DO NOTHING',
+      [userId]
+    );
+
+    const [user, weapons] = await Promise.all([
+      pool.query(
+        'SELECT coins FROM game_users WHERE telegram_id = $1',
+        [userId]
+      ),
+      pool.query(
+        'SELECT weapon_id FROM owned_weapons WHERE telegram_id = $1 ORDER BY weapon_id',
+        [userId]
+      )
+    ]);
+
+    res.json({
+      ok: true,
+      coins: Number(user.rows[0].coins),
+      ownedWeapons: weapons.rows.map(r => r.weapon_id)
+    });
+
+  } catch (error) {
+    console.error('GET /api/me failed:', error);
+
+    res.status(500).json({
+      ok: false,
+      error: 'Could not load player data'
+    });
+  }
+});
+
+// Создание счёта Telegram Stars
+app.post('/api/stars/invoice', requireTelegramUser, async (req, res) => {
+  const productId = req.body && req.body.productId;
+  const product = PRODUCTS[productId];
+
+  if (!product) {
+    return res.status(400).json({
+      ok: false,
+      error: 'Unknown product'
+    });
+  }
+
+  const client = await pool.connect();
+  let payload;
+
+  try {
+    payload = crypto.randomUUID();
+
+    await client.query('BEGIN');
+
+    await client.query(
+      'INSERT INTO game_users (telegram_id) VALUES ($1) ON CONFLICT DO NOTHING',
+      [req.telegramId]
+    );
+
+    await client.query(
+      'INSERT INTO payments (payload, telegram_id, product_id, stars) VALUES ($1, $2, $3, $4)',
+      [payload, req.telegramId, productId, product.stars]
+    );
+
+    await client.query('COMMIT');
+
+    const invoiceLink = await telegram('createInvoiceLink', {
+      title: product.title,
+      description: product.type === 'coins'
+        ? '100 монет для Zombie-Wave'
+        : `Постоянное разблокирование: ${product.title}`,
+      payload,
+      provider_token: '',
+      currency: 'XTR',
+      prices: [
+        {
+          label: product.title,
+          amount: product.stars
+        }
+      ]
+    });
+
+    res.json({
+      ok: true,
+      invoiceLink
+    });
+
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+
+    console.error('Invoice creation failed:', error);
+
+    res.status(502).json({
+      ok: false,
+      error: 'Could not create Telegram invoice'
+    });
+
+  } finally {
+    client.release();
+  }
+});
+
+// Подтверждение оплаты перед списанием Stars
+async function handlePreCheckout(query) {
+  const result = await pool.query(
+    `SELECT payload FROM payments
+     WHERE payload = $1
+     AND telegram_id = $2
+     AND stars = $3
+     AND status = 'pending'`,
+    [
+      query.invoice_payload,
+      String(query.from.id),
+      query.total_amount
+    ]
+  );
+
+  const valid =
+    query.currency === 'XTR' &&
+    result.rowCount === 1;
+
+  await telegram('answerPreCheckoutQuery', {
+    pre_checkout_query_id: query.id,
+    ok: valid,
+    ...(valid ? {} : {
+      error_message: 'Платёж не найден или его параметры не совпадают. Попробуйте открыть магазин заново.'
+    })
+  });
+}
+
+// Выдача товара после успешной оплаты
+async function handleSuccessfulPayment(message) {
+  const payment = message.successful_payment;
+  const telegramId = String(message.from.id);
+
+  if (payment.currency !== 'XTR') {
+    throw new Error('Unexpected payment currency');
+  }
+
+  const client = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+
+    const found = await client.query(
+      `SELECT product_id, stars, status
+       FROM payments
+       WHERE payload = $1
+       AND telegram_id = $2
+       FOR UPDATE`,
+      [
+        payment.invoice_payload,
+        telegramId
+      ]
+    );
+
+    if (found.rowCount !== 1) {
+      throw new Error('Payment payload not found for Telegram user');
+    }
+
+    const row = found.rows[0];
+
+    if (Number(row.stars) !== payment.total_amount) {
+      throw new Error('Payment amount mismatch');
+    }
+
+    if (row.status === 'paid') {
+      await client.query('COMMIT');
+      return;
+    }
+
+    if (row.status !== 'pending') {
+      throw new Error('Payment is not pending');
+    }
+
+    await client.query(
+      'INSERT INTO game_users (telegram_id) VALUES ($1) ON CONFLICT DO NOTHING',
+      [telegramId]
+    );
+
+    const product = PRODUCTS[row.product_id];
+
+    if (!product) {
+      throw new Error('Unknown product in payment record');
+    }
+
+    if (product.type === 'coins') {
+      await client.query(
+        'UPDATE game_users SET coins = coins + $1 WHERE telegram_id = $2',
+        [product.amount, telegramId]
+      );
+    } else {
+      await client.query(
+        'INSERT INTO owned_weapons (telegram_id, weapon_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+        [telegramId, row.product_id]
+      );
+    }
+
+    await client.query(
+      `UPDATE payments
+       SET status = 'paid',
+           telegram_charge_id = $1,
+           paid_at = NOW()
+       WHERE payload = $2`,
+      [
+        payment.telegram_payment_charge_id,
+        payment.invoice_payload
+      ]
+    );
+
+    await client.query('COMMIT');
+
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+
+  } finally {
+    client.release();
+  }
+}
+
+// Webhook Telegram
+app.post('/telegram/webhook', async (req, res) => {
+  if (
+    req.get('x-telegram-bot-api-secret-token') !== WEBHOOK_SECRET
+  ) {
+    return res.sendStatus(401);
+  }
+
+  res.sendStatus(200);
+
+  try {
+    const update = req.body;
+
+    if (update.pre_checkout_query) {
+      await handlePreCheckout(update.pre_checkout_query);
+    }
+
+    if (
+      update.message &&
+      update.message.successful_payment
+    ) {
+      await handleSuccessfulPayment(update.message);
+    }
+
+    if (
+      update.message &&
+      typeof update.message.text === 'string' &&
+      update.message.text.startsWith('/paysupport')
+    ) {
+      await telegram('sendMessage', {
+        chat_id: update.message.chat.id,
+        text: 'По вопросам оплаты Zombie-Wave напишите администратору игры.'
+      });
+    }
+
+  } catch (error) {
+    console.error('Webhook update handling failed:', error);
+  }
+});
+
+// Запуск сервера
+const port = Number(process.env.PORT || 3000);
+
+initDb()
+  .then(() => {
+    app.listen(port, () => {
+      console.log(`Zombie-Wave server listening on ${port}`);
+    });
+  })
+  .catch(error => {
+    console.error('Database initialization failed:', error);
+    process.exit(1);
+  });
